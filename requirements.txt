@@ -1,0 +1,9 @@
+python-telegram-bot==22.8
+python-dotenv==1.2.2
+google-genai
+openai
+feedparser
+beautifulsoup4
+requests
+urllib3
+PySocks
