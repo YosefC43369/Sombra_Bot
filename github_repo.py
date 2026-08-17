@@ -66,6 +66,7 @@ MAX_FILE_COUNT = 5000
 MAX_REPOSITORY_SIZE_BYTES = 250 * 1024 * 1024
 MAX_TOTAL_WORKSPACE_BYTES = 2048 * 1024 * 1024
 MAX_CLONE_TIME_SECONDS = 120
+GIT_METADATA_TIMEOUT_SECONDS = 10
 DEFAULT_REPOSITORY_TTL_SECONDS = 24 * 60 * 60
 
 _active_clone_count = 0
@@ -144,7 +145,16 @@ def get_workspace_path(repository_id) -> Optional[str]:
     info = get_repository_info(repository_id)
     if not info or info.get("status") != "READY" or not info.get("workspace_id"):
         return None
-    return os.path.join(WORKSPACE_ROOT, info["workspace_id"])
+    # workspace_id is a server-generated uuid4().hex in normal operation,
+    # but it is still untrusted DB content: a forged or corrupted value
+    # (e.g. "/etc" or "../../../etc") must never resolve outside
+    # WORKSPACE_ROOT via the classic os.path.join(root, "/abs") footgun.
+    candidate = os.path.join(WORKSPACE_ROOT, info["workspace_id"])
+    if not _is_within_workspace_root(candidate):
+        return None
+    if not os.path.isdir(candidate):
+        return None
+    return candidate
 
 
 # ---------------- URL validation ----------------
@@ -266,6 +276,13 @@ def list_repository_files(repository_id, subpath: Optional[str] = None) -> List[
     if not info or not info.get("workspace_id"):
         return []
     workspace_path = os.path.join(WORKSPACE_ROOT, info["workspace_id"])
+    # Same forged/corrupted workspace_id containment check as
+    # get_workspace_path() -- without this, a bad workspace_id could walk
+    # and return a listing of an arbitrary host directory.
+    if not _is_within_workspace_root(workspace_path):
+        return []
+    if not os.path.isdir(workspace_path):
+        return []
 
     base = workspace_path
     if subpath:
@@ -289,6 +306,29 @@ def list_repository_files(repository_id, subpath: Optional[str] = None) -> List[
                 size = 0
             results.append({"path": rel, "size": size})
     return results
+
+
+# ---------------- Total workspace quota ----------------
+
+def _workspace_reserved_and_ready_bytes() -> int:
+    """Bytes currently counted against MAX_TOTAL_WORKSPACE_BYTES: the real
+    size of every READY repository, plus a worst-case MAX_REPOSITORY_SIZE_BYTES
+    reservation for every CLONING repository that is still within its clone
+    time budget. FAILED/DELETED/EXPIRED rows never count. A CLONING row
+    whose process died mid-clone (so nothing will ever move it to
+    READY/FAILED) goes stale once it is older than twice the clone
+    timeout, and is excluded from then on -- otherwise a crashed clone
+    would permanently eat into the quota until the DB row is touched by
+    hand."""
+    stale_before = int(time.time()) - (MAX_CLONE_TIME_SECONDS * 2)
+    conn = _conn()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM github_repositories "
+        "WHERE status = 'READY' OR (status = 'CLONING' AND created_at >= ?)",
+        (stale_before,),
+    ).fetchone()
+    conn.close()
+    return row["total"] or 0
 
 
 # ---------------- Concurrency slots ----------------
@@ -326,20 +366,28 @@ def _run_git_clone(clone_url, workspace_path):
 
 
 def _get_branch(workspace_path) -> Optional[str]:
-    proc = subprocess.run(
-        ["git", "-C", workspace_path, "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workspace_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True,
+            timeout=GIT_METADATA_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
     if proc.returncode == 0 and proc.stdout:
         return proc.stdout.strip()
     return None
 
 
 def _get_commit_sha(workspace_path) -> Optional[str]:
-    proc = subprocess.run(
-        ["git", "-C", workspace_path, "rev-parse", "HEAD"],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workspace_path, "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+            timeout=GIT_METADATA_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
     if proc.returncode == 0 and proc.stdout:
         return proc.stdout.strip()
     return None
@@ -366,71 +414,119 @@ async def clone_repository(url, chat_id, created_by) -> CloneResult:
         return CloneResult(ok=False, reason="TOO_MANY_CONCURRENT_CLONES",
                             detail="too many clones already in progress")
 
-    workspace_id, workspace_path = _new_workspace_path()
-    now = int(time.time())
-    expires_at = now + DEFAULT_REPOSITORY_TTL_SECONDS
-
-    conn = _conn()
-    cur = conn.execute(
-        "INSERT INTO github_repositories "
-        "(chat_id, created_by, owner, name, clone_url, workspace_id, status, created_at, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'CLONING', ?, ?)",
-        (chat_id, created_by, ref.owner, ref.name, ref.clone_url, workspace_id, now, expires_at),
-    )
-    conn.commit()
-    repository_id = cur.lastrowid
-    conn.close()
-
-    write_audit_log(chat_id, created_by, actor="user", action="GITHUB_CLONE_STARTED",
-                     detail=f"repository_id={repository_id} url={ref.clone_url}")
-
-    def _fail(reason, detail=""):
-        _mark_failed(repository_id, workspace_path)
-        write_audit_log(chat_id, created_by, actor="system", action="GITHUB_CLONE_FAILED",
-                         detail=f"repository_id={repository_id} reason={reason}")
-        return CloneResult(ok=False, repository_id=repository_id, reason=reason, detail=detail)
-
+    # Everything below holds a clone slot. From here on, no matter which
+    # path we exit through -- an anticipated failure, a bug in this
+    # function, or an exception raised by code we called -- the `finally`
+    # guarantees the slot is released exactly once. `repository_id` /
+    # `workspace_path` stay None until the DB row actually exists, so the
+    # catch-all below knows whether there is anything in the DB/disk left
+    # to clean up.
+    repository_id = None
+    workspace_path = None
     try:
-        proc = await asyncio.to_thread(_run_git_clone, ref.clone_url, workspace_path)
-    except subprocess.TimeoutExpired:
+        # Total-workspace-quota check + reservation. This has no `await`
+        # between reading the current usage and inserting this clone's
+        # own reservation row below, so under concurrent clone_repository()
+        # calls one of them always loses the race deterministically --
+        # asyncio never preempts a task mid-(non-awaiting)-statement-run,
+        # so nothing else can slip in and observe stale usage.
+        reserved = _workspace_reserved_and_ready_bytes()
+        if reserved + MAX_REPOSITORY_SIZE_BYTES > MAX_TOTAL_WORKSPACE_BYTES:
+            return CloneResult(ok=False, reason="WORKSPACE_QUOTA_EXCEEDED",
+                                detail="workspace storage quota is currently full")
+
+        workspace_id, workspace_path = _new_workspace_path()
+        now = int(time.time())
+        expires_at = now + DEFAULT_REPOSITORY_TTL_SECONDS
+
+        conn = _conn()
+        cur = conn.execute(
+            "INSERT INTO github_repositories "
+            "(chat_id, created_by, owner, name, clone_url, workspace_id, status, "
+            "size_bytes, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'CLONING', ?, ?, ?)",
+            (chat_id, created_by, ref.owner, ref.name, ref.clone_url, workspace_id,
+             MAX_REPOSITORY_SIZE_BYTES, now, expires_at),
+        )
+        conn.commit()
+        repository_id = cur.lastrowid
+        conn.close()
+
+        write_audit_log(chat_id, created_by, actor="user", action="GITHUB_CLONE_STARTED",
+                         detail=f"repository_id={repository_id} url={ref.clone_url}")
+
+        def _fail(reason, detail=""):
+            _mark_failed(repository_id, workspace_path)
+            write_audit_log(chat_id, created_by, actor="system", action="GITHUB_CLONE_FAILED",
+                             detail=f"repository_id={repository_id} reason={reason}")
+            return CloneResult(ok=False, repository_id=repository_id, reason=reason, detail=detail)
+
+        try:
+            proc = await asyncio.to_thread(_run_git_clone, ref.clone_url, workspace_path)
+        except subprocess.TimeoutExpired:
+            return _fail("CLONE_TIMEOUT", "git clone exceeded the time limit")
+        except OSError as exc:
+            return _fail("CLONE_ERROR", str(exc))
+
+        if proc.returncode != 0:
+            return _fail("CLONE_FAILED", (proc.stderr or "").strip())
+
+        try:
+            _strip_unsafe_symlinks(workspace_path)
+            file_count, size_bytes = _scan_workspace(workspace_path)
+        except OSError:
+            # Never echo the raw OSError (may contain a host filesystem
+            # path) back to a caller that could relay it to Telegram.
+            return _fail("SCAN_ERROR", "failed to inspect the cloned repository")
+
+        if size_bytes > MAX_REPOSITORY_SIZE_BYTES:
+            return _fail("REPOSITORY_TOO_LARGE", f"{size_bytes} bytes exceeds the {MAX_REPOSITORY_SIZE_BYTES} byte limit")
+
+        if file_count > MAX_FILE_COUNT:
+            return _fail("FILE_COUNT_EXCEEDED", f"{file_count} files exceeds the {MAX_FILE_COUNT} file limit")
+
+        # Off the event loop thread: _get_branch/_get_commit_sha each carry
+        # their own bounded timeout and never raise, but they're still a
+        # blocking subprocess.run call underneath.
+        branch = await asyncio.to_thread(_get_branch, workspace_path)
+        commit_sha = await asyncio.to_thread(_get_commit_sha, workspace_path)
+
+        conn = _conn()
+        conn.execute(
+            "UPDATE github_repositories SET status='READY', branch=?, commit_sha=?, "
+            "file_count=?, size_bytes=? WHERE repository_id=?",
+            (branch, commit_sha, file_count, size_bytes, repository_id),
+        )
+        conn.commit()
+        conn.close()
+
+        try:
+            write_audit_log(chat_id, created_by, actor="system", action="GITHUB_CLONE_COMPLETED",
+                             detail=f"repository_id={repository_id} files={file_count} bytes={size_bytes}")
+        except Exception:
+            # The clone itself already succeeded and is committed as
+            # READY; an audit-log hiccup must not turn that into a
+            # reported failure (and must not be caught below, which would
+            # incorrectly flip this row back to FAILED).
+            logger.exception("audit log write failed after successful clone repository_id=%s", repository_id)
+
+        return CloneResult(ok=True, repository_id=repository_id)
+
+    except Exception:
+        # Catch-all for anything not anticipated above (e.g. a database
+        # error, or a bug in a helper we called). Without this, an
+        # unexpected exception here would propagate out of
+        # clone_repository() entirely: the clone slot would leak forever,
+        # and any DB row already inserted would stay stuck at CLONING.
+        logger.exception("unexpected error in clone_repository")
+        if repository_id is not None:
+            _mark_failed(repository_id, workspace_path)
+            write_audit_log(chat_id, created_by, actor="system", action="GITHUB_CLONE_FAILED",
+                             detail=f"repository_id={repository_id} reason=INTERNAL_ERROR")
+        return CloneResult(ok=False, repository_id=repository_id, reason="INTERNAL_ERROR",
+                            detail="an unexpected internal error occurred")
+    finally:
         await _release_clone_slot()
-        return _fail("CLONE_TIMEOUT", "git clone exceeded the time limit")
-    except OSError as exc:
-        await _release_clone_slot()
-        return _fail("CLONE_ERROR", str(exc))
-
-    if proc.returncode != 0:
-        await _release_clone_slot()
-        return _fail("CLONE_FAILED", (proc.stderr or "").strip())
-
-    _strip_unsafe_symlinks(workspace_path)
-    file_count, size_bytes = _scan_workspace(workspace_path)
-
-    if size_bytes > MAX_REPOSITORY_SIZE_BYTES:
-        await _release_clone_slot()
-        return _fail("REPOSITORY_TOO_LARGE", f"{size_bytes} bytes exceeds the {MAX_REPOSITORY_SIZE_BYTES} byte limit")
-
-    if file_count > MAX_FILE_COUNT:
-        await _release_clone_slot()
-        return _fail("FILE_COUNT_EXCEEDED", f"{file_count} files exceeds the {MAX_FILE_COUNT} file limit")
-
-    branch = _get_branch(workspace_path)
-    commit_sha = _get_commit_sha(workspace_path)
-
-    conn = _conn()
-    conn.execute(
-        "UPDATE github_repositories SET status='READY', branch=?, commit_sha=?, "
-        "file_count=?, size_bytes=? WHERE repository_id=?",
-        (branch, commit_sha, file_count, size_bytes, repository_id),
-    )
-    conn.commit()
-    conn.close()
-
-    await _release_clone_slot()
-    write_audit_log(chat_id, created_by, actor="system", action="GITHUB_CLONE_COMPLETED",
-                     detail=f"repository_id={repository_id} files={file_count} bytes={size_bytes}")
-
-    return CloneResult(ok=True, repository_id=repository_id)
 
 
 # ---------------- Cleanup / TTL ----------------
@@ -455,18 +551,26 @@ def _sweep_expired_once() -> int:
     now = int(time.time())
     conn = _conn()
     rows = conn.execute(
-        "SELECT repository_id, workspace_id FROM github_repositories "
+        "SELECT repository_id, workspace_id, chat_id, created_by FROM github_repositories "
         "WHERE expires_at IS NOT NULL AND expires_at < ? "
         "AND status NOT IN ('DELETED', 'EXPIRED', 'FAILED')",
         (now,),
     ).fetchall()
-    removed = 0
+    expired_rows = []
     for row in rows:
         if row["workspace_id"]:
             _rmtree_safe(os.path.join(WORKSPACE_ROOT, row["workspace_id"]))
         conn.execute("UPDATE github_repositories SET status='EXPIRED' WHERE repository_id=?",
                      (row["repository_id"],))
-        removed += 1
+        expired_rows.append(row)
     conn.commit()
     conn.close()
-    return removed
+
+    # Audit-log each expiry after the DB transaction is committed and
+    # closed (write_audit_log opens its own connection -- same ordering
+    # used everywhere else in this module).
+    for row in expired_rows:
+        write_audit_log(row["chat_id"], row["created_by"], actor="system",
+                         action="GITHUB_REPO_EXPIRED", detail=f"repository_id={row['repository_id']}")
+
+    return len(expired_rows)
