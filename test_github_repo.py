@@ -737,6 +737,56 @@ class GithubRepoTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(gr.get_workspace_path(repository_id))
         self.assertEqual(gr.list_repository_files(repository_id), [])
 
+    # ================= Phase 7: list_repositories_for_chat =================
+    # (added for the Telegram /github list command, which needs a
+    # chat-scoped listing API -- github_repo.py had no such function
+    # before this integration pass.)
+
+    def test_list_repositories_for_chat_most_recent_first(self):
+        r1 = self._insert_repo_row(workspace_id="ws1", chat_id=42, status="READY")
+        r2 = self._insert_repo_row(workspace_id="ws2", chat_id=42, status="READY")
+        r3 = self._insert_repo_row(workspace_id="ws3", chat_id=42, status="DELETED")
+        rows = gr.list_repositories_for_chat(42)
+        self.assertEqual([row["repository_id"] for row in rows], [r3, r2, r1])
+
+    def test_list_repositories_for_chat_scoped_to_chat_id(self):
+        self._insert_repo_row(workspace_id="ws_a", chat_id=1)
+        self._insert_repo_row(workspace_id="ws_b", chat_id=2)
+        rows_chat1 = gr.list_repositories_for_chat(1)
+        self.assertEqual(len(rows_chat1), 1)
+        self.assertEqual(rows_chat1[0]["chat_id"], 1)
+
+    def test_list_repositories_for_chat_empty_for_unknown_chat(self):
+        self.assertEqual(gr.list_repositories_for_chat(999999), [])
+
+    def test_list_repositories_for_chat_includes_terminal_statuses(self):
+        # /github list should show FAILED/DELETED/EXPIRED rows too --
+        # matching list_programs()/list_findings()'s "return everything,
+        # let the Telegram layer show the [status] tag" style, rather
+        # than silently hiding closed repositories.
+        self._insert_repo_row(workspace_id="ws_x", chat_id=7, status="FAILED")
+        rows = gr.list_repositories_for_chat(7)
+        self.assertEqual(rows[0]["status"], "FAILED")
+
+    # ================= Phase 7: sweep_expired_repositories (public wrapper) =================
+    # (added so app.py's periodic TTL sweep task has a stable, non-
+    # underscore-prefixed entry point instead of reaching into
+    # _sweep_expired_once() directly; no new sweep logic is introduced.)
+
+    def test_sweep_expired_repositories_expires_past_ttl_row(self):
+        self._insert_repo_row(workspace_id="ws_old", status="READY",
+                               expires_at=int(time.time()) - 10)
+        self.assertEqual(gr.sweep_expired_repositories(), 1)
+        info = gr.get_repository_info(
+            gr.list_repositories_for_chat(1)[0]["repository_id"]
+        )
+        self.assertEqual(info["status"], "EXPIRED")
+
+    def test_sweep_expired_repositories_zero_when_nothing_expired(self):
+        self._insert_repo_row(workspace_id="ws_fresh", status="READY",
+                               expires_at=int(time.time()) + 999999)
+        self.assertEqual(gr.sweep_expired_repositories(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
