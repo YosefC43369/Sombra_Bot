@@ -308,6 +308,22 @@ def list_repository_files(repository_id, subpath: Optional[str] = None) -> List[
     return results
 
 
+def list_repositories_for_chat(chat_id: int) -> List[Dict]:
+    """Most-recent-first list of every repository ever cloned in this
+    chat (all statuses, including DELETED/EXPIRED/FAILED) -- matches the
+    read-all-rows style of scope_policy.list_programs()/findings.
+    list_findings() elsewhere in this project. Read-only; keeps ownership
+    of the github_repositories table inside this module instead of a
+    caller (e.g. app.py) querying sqlite3 directly."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM github_repositories WHERE chat_id=? ORDER BY repository_id DESC",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 # ---------------- Total workspace quota ----------------
 
 def _workspace_reserved_and_ready_bytes() -> int:
@@ -574,3 +590,13 @@ def _sweep_expired_once() -> int:
                          action="GITHUB_REPO_EXPIRED", detail=f"repository_id={row['repository_id']}")
 
     return len(expired_rows)
+
+
+def sweep_expired_repositories() -> int:
+    """Public entry point for periodic TTL enforcement (e.g. app.py's
+    background sweep task). _sweep_expired_once() already existed and was
+    already tested by the previous hardening pass but had no public,
+    non-underscore-prefixed name for an external caller to invoke on a
+    schedule -- without one, DEFAULT_REPOSITORY_TTL_SECONDS is set but
+    never actually enforced. This wrapper adds no new logic."""
+    return _sweep_expired_once()
