@@ -48,6 +48,9 @@ from findings import (
     VALID_SEVERITIES, VALID_STATUSES, VALID_EVIDENCE_TYPES, MAX_EVIDENCE_BYTES,
 )
 
+import debt_ledger as dl
+import debt_report as dr
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "bot.db"
 
@@ -336,7 +339,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"แท็ก @{context.bot.username} แล้วพิมพ์คำถาม - ถาม AI\n"
         f"ส่งรูปภาพ/ไฟล์ PDF/TXT พร้อม caption แท็ก @{context.bot.username} "
         f"(หรือ Reply รูป/ไฟล์เดิมแล้วแท็ก) - ให้ AI วิเคราะห์รูป/ไฟล์\n"
-        "/imagine <คำอธิบาย> - ให้ AI สร้างรูปภาพแล้วส่งเข้าแชท"
+        "/imagine <คำอธิบาย> - ให้ AI สร้างรูปภาพแล้วส่งเข้าแชท\n"
+        "/sign <ชื่อ> <จำนวนเงิน> [รายการ...] - บันทึกยอดค้างชำระ (Admin)\n"
+        "/debt [ชื่อ|unpaid|paid|all] - ดูรายการค้างชำระ\n"
+        "/debt_summary [YYYY-MM] [ai] - สรุปยอดค้างชำระรายเดือน\n"
+        "/paid <เลขที่รายการ|ชื่อ> [YYYY-MM] - ปิดยอดชำระ (Admin)"
     )
     await update.message.reply_text(text)
     
@@ -1246,6 +1253,190 @@ async def cmd_bbevidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ subcommand ไม่ถูกต้อง (add/list/verify/remove)")
 
+# ---------------- Debt Ledger ("เซ็นสินค้า") ----------------
+#
+# /sign, /debt, /debt_summary, /paid -- Telegram wiring only. Every
+# baht figure comes from debt_ledger.py's integer arithmetic; app.py
+# never adds, sums, or parses money itself. debt_report.py owns all
+# Thai-language formatting -- these handlers never build a reply
+# string by hand beyond a one-line usage/error message, matching the
+# existing /bbreport / /bbfinding split between app.py (Telegram I/O)
+# and its data/report module.
+#
+# /sign and /paid mutate the ledger (real money someone owes), so
+# both are admin-gated, same rationale as /addword /mute /bbprogram.
+# /debt and /debt_summary are read-only and open to any chat member,
+# same rationale as /bbfinding list /bbauth list -- so staff can check
+# their own tab without needing an admin to look it up for them.
+
+_DEBT_DENY_TH = {
+    "NAME_REQUIRED": "กรุณาระบุชื่อ",
+    "NAME_TOO_LONG": f"ชื่อยาวเกินไป (จำกัด {dl.MAX_NAME_LEN} ตัวอักษร)",
+    "INVALID_AMOUNT": "จำนวนเงินไม่ถูกต้อง (ต้องเป็นตัวเลขมากกว่า 0)",
+    "DESCRIPTION_TOO_LONG": f"รายละเอียดยาวเกินไป (จำกัด {dl.MAX_DESCRIPTION_LEN} ตัวอักษร)",
+    "DB_ERROR": "เกิดข้อผิดพลาดกับฐานข้อมูล ลองใหม่อีกครั้ง",
+    "ENTRY_NOT_FOUND": "ไม่พบรายการนี้",
+    "ALREADY_PAID": "รายการนี้จ่ายไปแล้ว",
+    "NO_UNPAID_ENTRIES": "ไม่มีรายการค้างชำระของชื่อนี้",
+}
+
+
+def _deny_text_debt(reason: str) -> str:
+    return "❌ " + _DEBT_DENY_TH.get(reason, reason)
+
+
+async def cmd_sign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sign <ชื่อ> <จำนวนเงิน> [รายการ...] -- บันทึกยอดค้างชำระใหม่ 1 รายการ
+    (Admin only). ตัวอย่าง: /sign สมชาย 50 ข้าวกล่อง
+    ชื่อรับเป็นคำเดียว (ไม่มีเว้นวรรค) ตามตัวอย่าง; ทุกอย่างหลังจำนวนเงินถือ
+    เป็นรายละเอียดสินค้า (จะเว้นวรรคกี่คำก็ได้)."""
+    if not await is_admin(update, context):
+        return await update.message.reply_text("❌ คำสั่งนี้ใช้ได้เฉพาะ Admin")
+    args = context.args or []
+    if len(args) < 2:
+        return await update.message.reply_text(
+            "ใช้งาน: /sign <ชื่อ> <จำนวนเงิน> [รายการ...]\nตัวอย่าง: /sign สมชาย 50 ข้าวกล่อง"
+        )
+    name = args[0]
+    amount_satang = dl.parse_amount_to_satang(args[1])
+    if amount_satang is None:
+        return await update.message.reply_text(_deny_text_debt("INVALID_AMOUNT"))
+    description = " ".join(args[2:])
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    result = dl.add_entry(chat_id, name, amount_satang, recorded_by=user.id,
+                           item_description=description)
+    if not result.ok:
+        return await update.message.reply_text(_deny_text_debt(result.reason))
+    entry = dl.get_entry(result.entry_id)
+    await update.message.reply_text(dr.format_sign_confirmation(entry))
+
+
+_DEBT_STATUS_KEYWORDS = {
+    "unpaid": dl.EntryStatus.UNPAID.value,
+    "paid": dl.EntryStatus.PAID.value,
+    "all": None,
+}
+
+
+async def cmd_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/debt [ชื่อ|unpaid|paid|all] -- ดูรายการค้างชำระ (เปิดให้สมาชิกทุกคน
+    ดูได้ ไม่ต้องเป็น Admin). ไม่ใส่ argument = รายการที่ยังไม่จ่ายทั้งหมด."""
+    args = context.args or []
+    chat_id = update.effective_chat.id
+    status_filter = dl.EntryStatus.UNPAID.value
+    debtor_name = None
+    title = "รายการค้างชำระ"
+    if args:
+        first = args[0].lower()
+        if first in _DEBT_STATUS_KEYWORDS:
+            status_filter = _DEBT_STATUS_KEYWORDS[first]
+            title = {"unpaid": "รายการค้างชำระ", "paid": "รายการที่จ่ายแล้ว",
+                     "all": "รายการทั้งหมด"}[first]
+        else:
+            debtor_name = args[0]
+            title = f"รายการค้างชำระของ {debtor_name}"
+
+    entries = dl.list_entries(chat_id, status=status_filter, debtor_name=debtor_name)
+    await _reply_chunked(update, dr.format_entries_table(entries, title=title))
+
+
+async def cmd_debt_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/debt_summary [YYYY-MM] [ai] -- สรุปยอดค้างชำระต่อคนของรอบเดือนหนึ่ง
+    (ไม่ใส่เดือน = เดือนก่อนหน้าเดือนปัจจุบัน ตาม Asia/Bangkok). เปิดให้
+    สมาชิกทุกคนดูได้ ไม่ต้องเป็น Admin.
+
+    ตัวเลขทั้งหมดคำนวณจาก debt_ledger.summarize_by_debtor() (Python int
+    arithmetic ล้วนๆ) ก่อนเสมอ -- ส่วน 'ai' ต่อท้ายเป็นแค่ตัวเลือกให้ AI
+    ช่วยเรียบเรียงคำอธิบายเพิ่มเติมแบบ best-effort เท่านั้น ถ้า AI ใช้งาน
+    ไม่ได้หรือ error ก็ยังได้สรุปตัวเลขจริงตามปกติ (AI ไม่มีสิทธิ์คำนวณ
+    หรือแก้ไขตัวเลขใดๆ ในรายงานนี้)."""
+    args = list(context.args or [])
+    use_ai = bool(args) and args[-1].lower() == "ai"
+    if use_ai:
+        args = args[:-1]
+
+    chat_id = update.effective_chat.id
+    if args:
+        parsed = dl.parse_month_arg(args[0])
+        if parsed is None:
+            return await update.message.reply_text(
+                "❌ รูปแบบเดือนไม่ถูกต้อง ใช้ YYYY-MM เช่น /debt_summary 2026-08"
+            )
+        date_from, date_to = parsed
+    else:
+        date_from, date_to = dl.previous_month_range()
+
+    summary = dl.summarize_by_debtor(chat_id, date_from, date_to)
+    text = dr.format_debt_summary(summary)
+
+    if use_ai:
+        ok, ai_text = await gemini.ask_gemini(
+            "นี่คือสรุปยอดค้างชำระที่คำนวณเสร็จแล้วจากฐานข้อมูล (ตัวเลขถูกต้อง "
+            "100% ห้ามคำนวณใหม่หรือแก้ไขตัวเลขใดๆ):\n\n" + text +
+            "\n\nช่วยเรียบเรียงเป็นคำอธิบายสั้นๆ ภาษาไทยแบบเป็นกันเองเพิ่มเติมจากตาราง"
+            " ใช้ตัวเลขตามที่ให้มาเท่านั้น",
+            system_instruction=(
+                "คุณคือผู้ช่วยเรียบเรียงรายงานการเงินให้อ่านง่ายขึ้น ห้ามคำนวณ "
+                "หรือเปลี่ยนแปลงตัวเลขที่ได้รับมาเด็ดขาด ใช้ตัวเลขที่ให้มาเท่านั้น"
+            ),
+        )
+        if ok:
+            text += "\n\n🤖 " + ai_text
+        # AI ใช้ไม่ได้ -- ส่งสรุปตัวเลขจริงต่อไปตามปกติ ไม่ต้องแจ้ง error
+
+    await _reply_chunked(update, text)
+    write_audit_log(chat_id, update.effective_user.id, actor="user",
+                     action="DEBT_SUMMARY_VIEW", detail=f"{date_from}..{date_to}")
+
+
+async def cmd_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/paid <เลขที่รายการ> -- ปิดยอดรายการเดียว
+    /paid <ชื่อ> [YYYY-MM] -- ปิดยอดค้างชำระทั้งหมดของคนคนหนึ่ง (ระบุเดือน
+    ได้เพื่อปิดเฉพาะรอบนั้น) -- Admin only ทั้งสองแบบ. รายการที่จ่ายแล้ว
+    ยังอยู่ในฐานข้อมูล (ไม่ถูกลบ) เพื่อการตรวจสอบย้อนหลัง แค่ไม่ถูกนับใน
+    ยอดค้างชำระอีกต่อไป."""
+    if not await is_admin(update, context):
+        return await update.message.reply_text("❌ คำสั่งนี้ใช้ได้เฉพาะ Admin")
+    args = context.args or []
+    if not args:
+        return await update.message.reply_text(
+            "ใช้งาน:\n"
+            "/paid <เลขที่รายการ> - ปิดยอดรายการเดียว\n"
+            "/paid <ชื่อ> [YYYY-MM] - ปิดยอดค้างชำระทั้งหมดของคนคนหนึ่ง"
+        )
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    if args[0].isdigit():
+        entry_id = int(args[0])
+        result = dl.mark_entry_paid(entry_id, actor_user_id=user.id, chat_id=chat_id)
+        if not result.ok:
+            return await update.message.reply_text(_deny_text_debt(result.reason))
+        return await update.message.reply_text(
+            dr.format_paid_single(entry_id, result.total_satang)
+        )
+
+    name = args[0]
+    date_from = date_to = None
+    if len(args) >= 2:
+        parsed = dl.parse_month_arg(args[1])
+        if parsed is None:
+            return await update.message.reply_text(
+                "❌ รูปแบบเดือนไม่ถูกต้อง ใช้ YYYY-MM เช่น /paid สมชาย 2026-08"
+            )
+        date_from, date_to = parsed
+
+    result = dl.mark_debtor_paid(chat_id, name, actor_user_id=user.id,
+                                  date_from=date_from, date_to=date_to)
+    if not result.ok:
+        return await update.message.reply_text(_deny_text_debt(result.reason))
+    await update.message.reply_text(
+        dr.format_paid_bulk(name, result.updated_count, result.total_satang,
+                             date_from, date_to)
+    )
+
 # ---------------- Message Handler ----------------
 
 async def check_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
@@ -1473,6 +1664,7 @@ def main():
     detection.detection_db_init()
     scope_policy_db_init()
     findings_db_init()
+    dl.debt_ledger_db_init()
     logger.info("DATABASE: OK")
     
     app = (
@@ -1507,6 +1699,10 @@ def main():
     app.add_handler(CommandHandler("bbreport", cmd_bbreport))
     app.add_handler(CommandHandler("bbfinding", cmd_bbfinding))
     app.add_handler(CommandHandler("bbevidence", cmd_bbevidence))
+    app.add_handler(CommandHandler("sign", cmd_sign))
+    app.add_handler(CommandHandler("debt", cmd_debt))
+    app.add_handler(CommandHandler("debt_summary", cmd_debt_summary))
+    app.add_handler(CommandHandler("paid", cmd_paid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(
         filters.PHOTO & filters.CaptionRegex(IMAGINE_CAPTION_RE),
