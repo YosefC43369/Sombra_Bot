@@ -40,6 +40,7 @@ findings.py):
 import re
 import time
 import sqlite3
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -457,23 +458,8 @@ def summarize_by_debtor(
     status: str = EntryStatus.UNPAID.value,
 ) -> dict:
     """The one function every /debt_summary figure ultimately comes
-    from. Pulls entries in [date_from, date_to] (inclusive Asia/Bangkok
-    calendar dates) and sums them per debtor using plain Python int
-    addition — sum() over already-integer satang values, nothing
-    parsed, nothing estimated, nothing sent to an LLM. Returns:
-
-        {
-          "date_from": ..., "date_to": ..., "status": ...,
-          "by_debtor": [
-            {"debtor_name": ..., "count": ..., "total_satang": ...,
-             "entries": [...]},
-            ...  # sorted by debtor_name
-          ],
-          "grand_total_satang": ..., "grand_total_count": ...,
-        }
-
-    An empty date range (no matching entries) returns an empty
-    by_debtor list and zeroed totals rather than raising."""
+    ... (docstring ทั้งหมด) ...
+    """
     entries = list_entries(
         chat_id, status=status, date_from=date_from, date_to=date_to,
         limit=SUMMARY_ROW_LIMIT,
@@ -488,12 +474,7 @@ def summarize_by_debtor(
     for name in sorted(by_debtor.keys()):
         rows = by_debtor[name]
         total = sum(r["amount_satang"] for r in rows)
-        debtor_summaries.append({
-            "debtor_name": name,
-            "count": len(rows),
-            "total_satang": total,
-            "entries": rows,
-        })
+        debtor_summaries.append({...})
         grand_total_satang += total
         grand_total_count += len(rows)
 
@@ -505,3 +486,84 @@ def summarize_by_debtor(
         "grand_total_satang": grand_total_satang,
         "grand_total_count": grand_total_count,
     }
+    
+def _group_entries_by_debtor(entries: List[dict]) -> Tuple[List[dict], int, int]:
+    """Shared grouping/summation core for summarize_by_debtor() (fixed
+    date-range window) and summarize_debtors() (all-time window,
+    Requirement #2)."""
+    by_debtor: Dict[str, List[dict]] = {}
+    for e in entries:
+        by_debtor.setdefault(e["debtor_name"], []).append(e)
+        
+    debtor_summaries = []
+    grand_total_satang = 0
+    grand_total_count = 0
+    for name in sorted(by_debtor.keys()):
+        rows = by_debtor[name]
+        total = sum(r["amount_satang"] for r in rows)
+        debtor_summaries.append({
+            "debtor_name": name,
+            "count": len(rows),
+            "total_satang": total,
+            "entries": rows,
+        })
+        grand_total_satang += total
+        grand_total_count += len(rows)
+    return debtor_summaries, grand_total_satang, grand_total_count
+    
+def summarize_by_debtor(
+    chat_id: int,
+    date_from: str,
+    date_to: str,
+    status: str = EntryStatus.UNPAID.value,
+) -> dict:
+    entries = list_entries(
+        chat_id, status=status, date_from=date_from, date_to=date_to,
+        limit=SUMMARY_ROW_LIMIT,
+    )
+    debtor_summaries, grand_total_satang, grand_total_count = _group_entries_by_debtor(entries)
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "status": status,
+        "by_debtor": debtor_summaries,
+        "grand_total_satang": grand_total_satang,
+        "grand_total_count": grand_total_count,
+    }
+    
+def summarize_debtors(chat_id: int, status: str = EntryStatus.UNPAID.value) -> dict:
+    """Per-debtor grouping เหมือน summarize_by_debtor() แต่ไม่จำกัดช่วงวันที่
+    -- ใช้เป็นข้อมูลของ Dashboard /debt เปล่า (Requirement #2/#3)."""
+    entries = list_entries(chat_id, status=status, limit=SUMMARY_ROW_LIMIT)
+    debtor_summaries, grand_total_satang, grand_total_count = _group_entries_by_debtor(entries)
+    return {
+        "status": status,
+        "by_debtor": debtor_summaries,
+        "grand_total_satang": grand_total_satang,
+        "grand_total_count": grand_total_count,
+    }
+    
+def debtor_ref(chat_id: int, debtor_name: str) -> str:
+    """Identifier สั้น ปลอดภัยสำหรับ callback_data (Requirement #4/#5):
+    ห้ามใส่ชื่อดิบใน callback_data (ยาวเกิน 64 byte ได้ง่ายถ้าเป็นชื่อไทย)
+    -- ใช้ hash 10 ตัวอักษรแทน, deterministic ต่อ (chat_id, debtor_name)."""
+    digest = hashlib.sha256(f"{chat_id}:{debtor_name}".encode("utf-8")).hexdigest()
+    return digest[:10]
+    
+def list_distinct_debtors(chat_id: int) -> List[str]:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT DISTINCT debtor_name FROM debt_entries WHERE chat_id=?",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return [r["debtor_name"] for r in rows]
+
+
+def resolve_debtor_ref(chat_id: int, ref: str) -> Optional[str]:
+    """ย้อนกลับจาก ref -> ชื่อจริง, คืน None ถ้าไม่พบ (ไม่ raise) --
+    callback ของรายการที่ไม่มีอยู่แล้วต้องไม่ทำให้ bot crash (Requirement #7/#13)."""
+    for name in list_distinct_debtors(chat_id):
+        if debtor_ref(chat_id, name) == ref:
+            return name
+    return None
