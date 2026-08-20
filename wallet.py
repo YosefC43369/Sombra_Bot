@@ -318,10 +318,10 @@ def parse_signed_amount_to_satang(raw: Optional[str]) -> Optional[int]:
     if raw is None:
         return None
     text = raw.strip()
-    negative = text.startswith(text)
+    negative = text.startswith("-")
     if negative:
         text = text[1:]
-    satang = parse_amount_to_stang(text)
+    satang = parse_amount_to_satang(text)
     if satang is None:
         return None
     return -satang if negative else satang
