@@ -91,13 +91,37 @@ class ChainResult:
         return f"ChainResult(ok={self.ok!r}, reason={self.reason!r})"
 
 
+_warned_about_binary_env = False
+
+
 def find_binary():
-    """Locates the compiled Rust binary, or returns None. Checked on every
-    call rather than cached at import: a deploy that builds the binary after
-    the worker has already started then heals on the next anchor tick
-    instead of needing a restart."""
+    """Locates the compiled Rust binary, or returns None.
+
+    Search order: an explicitly configured CHAIN_BINARY, then the release
+    build, then the debug build, then PATH. The candidate paths are built
+    from this file's own absolute location, not the process working
+    directory, so they survive the bot being started from anywhere.
+
+    Checked on every call rather than cached at import: a deploy that builds
+    the binary after the worker has already started then heals on the next
+    anchor tick instead of needing a restart.
+
+    An explicitly configured CHAIN_BINARY is NOT silently fallen back on
+    when it is unusable -- a wrong path in the environment is a
+    misconfiguration to surface, not to paper over by quietly running some
+    other binary. It is logged once so it does not repeat on every tick."""
+    global _warned_about_binary_env
     if CHAIN_BINARY_ENV:
-        return CHAIN_BINARY_ENV if os.access(CHAIN_BINARY_ENV, os.X_OK) else None
+        if os.access(CHAIN_BINARY_ENV, os.X_OK):
+            return CHAIN_BINARY_ENV
+        if not _warned_about_binary_env:
+            _warned_about_binary_env = True
+            logger.warning(
+                "CHAIN: CHAIN_BINARY is set to %r but that path is not an "
+                "executable file -- the ledger stays unavailable rather than "
+                "falling back to another binary", CHAIN_BINARY_ENV,
+            )
+        return None
     for path in _CANDIDATE_PATHS:
         if os.access(path, os.X_OK):
             return path
