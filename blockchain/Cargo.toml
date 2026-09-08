@@ -1,0 +1,28 @@
+[package]
+name = "sombra-chain"
+version = "0.1.0"
+edition = "2021"
+description = "Private single-node append-only verifiable ledger for Sombra_Bot"
+license = "MIT"
+
+[lib]
+name = "sombra_chain"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sombra-chain"
+path = "src/main.rs"
+
+# NOTE: serde_json's `preserve_order` feature must stay OFF. The default
+# serde_json::Map is a BTreeMap, so object keys serialize in sorted order,
+# which is what makes every metadata JSON string (and therefore every
+# payload hash) byte-for-byte reproducible.
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+hex = "0.4"
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+strip = true
