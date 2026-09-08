@@ -38,7 +38,7 @@ import os
 import re
 import ast
 import logging
-from dataclasses import dataclss, field
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 
 from github_repo import get_workspace_path
